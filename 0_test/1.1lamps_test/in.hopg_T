@@ -1,0 +1,111 @@
+# ======================= Global Settings =======================
+units          real
+atom_style     charge
+boundary       p p f
+dimension      3
+
+# ---------------- User parameters ----------------
+variable T           equal 2000.0      # K
+variable vin_kms     equal 8.0         # km/s
+variable sigma_GPa   equal 0.0
+variable Tdamp       equal 100.0       # fs
+variable slab_th     equal 2.0         # Å
+
+# --- Automatic Unit Conversions ---
+variable vin_Afs     equal ${vin_kms}*0.01   # Å/fs
+variable Fz          equal ${sigma_GPa}*1.439326e-4  # GPa→kcal/mol Å⁻³
+
+# =================== Build box & atoms ===================
+region	    box block 0.0 62.35382907247957 0.0 64.800000000000011 0.0 310.05000000000001
+create_box  2 box
+read_data   hopg_init.data add append
+mass 1 12.011 # C
+mass 2 16.000 # O
+
+# ============ ReaxFF & QEq =============
+pair_style  reax/c NULL safezone 3.0 mincap 5000
+pair_coeff  * * ffield.reax.cho C O
+fix         qeq all qeq/reax 1 0.0 10.0 1e-6 param.qeq 
+
+# ---------- Neighbor list AFTER pair_style ----------
+neighbor     2.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# ========== Groups: bottom fixed, mobile ==========
+group	fixed_layer id <= 1500
+group   mobile subtract all fixed_layer
+fix     hold fixed_layer setforce 0.0 0.0 0.0
+velocity fixed_layer set 0.0 0.0 0.0 units box
+
+# ============== Initial NVT relaxation ==============
+velocity mobile create ${T} 12345 mom yes rot yes dist gaussian
+fix      relax mobile nvt temp ${T} ${T} ${Tdamp}
+timestep 0.1
+
+# --- Dump for relaxation phase ---
+dump        relax_dump all xyz 100 relaxation_${T}.xyz
+dump_modify relax_dump element C O
+
+# --- Run the relaxation ---
+run      1000    # 1 ps test run
+
+# --- Clean up after relaxation ---
+unfix    relax
+undump   relax_dump
+reset_timestep 0
+
+# ================ Production integrator (NVE) ================
+fix integrator all nve
+
+# ---------------- Temperatures and logging ----------------
+# Global temperature (includes deposits); DOF changes over time
+compute  Tall all temp
+compute_modify Tall dynamic/dof yes
+
+# Substrate temperature (carbon only)
+group    carbon type 1
+group    carbon_mob subtract carbon fixed_layer
+compute  Tsub carbon_mob temp
+
+# Beam/gas temperature (deposited O atoms only; see deposit group below)
+group    obeam empty
+compute  Tbeam obeam temp
+compute_modify Tbeam dynamic/dof yes
+
+# Print all three temps in thermo
+thermo_style  custom step temp c_Tsub c_Tbeam c_Tall pe ke etotal atoms
+thermo		100
+thermo_modify temp Tall
+
+# Optional: also write a time series to file (every 1000 steps)
+fix     Tlog all ave/time 10 100 1000 c_Tsub c_Tbeam c_Tall file temps.out
+
+# -------- Dynamic top‑layer stress --------
+#compute  zcoord mobile property/atom z
+#compute  maxz   mobile reduce max c_zcoord
+#variable is_top atom "c_zcoord > (c_maxz - v_slab_th)"
+#group    stress_region dynamic mobile var is_top every 100
+#fix      addstress stress_region addforce 0.0 0.0 0.0  #handon
+
+# ----------------- Reflective walls -----------------
+fix wall_bottom all wall/reflect zlo EDGE
+fix wall_top    all wall/reflect zhi EDGE
+
+# ---------------- O Atom Injection (Corrected) ----------------
+# ---------- 定义顶面注入面 ----------
+region	inject_slab block 0.0 62.35382907247957 0.0 64.800000000000011 40 60 side in units box
+fix dep obeam deposit 5 2 1000 48174 region inject_slab near 1.5 attempt 50 vz -0.0776 -0.0776 units box
+fix	spe all reax/c/species 1 10 10 species.out  element C O
+
+# ---------------- Diagnostics & output ----------------
+dump	    1 all custom 100 trajectory.T_${T}_v${vin_kms}.xyz id type x y z
+#restart         200000 restart.temp
+
+# For short test runs, you may want to comment out file I/O you don't need
+# fix bonds   all reax/c/bonds 100 bonds.test.txt
+# fix species all reax/c/species 100 100 1000 species.test.out element C O
+# restart     2000 restart.test.bin
+
+# ---------------- Main run for testing ----------------
+timestep 0.1
+run      5000    # 500 ps test run

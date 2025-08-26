@@ -1,0 +1,136 @@
+# ======================= Global Settings =======================
+processors     * * 1
+units          real
+atom_style     charge              # required for reax/c
+boundary       p p f
+dimension      3
+
+# ---------------- User parameters ----------------
+variable T                equal 1900.0     # K
+variable vin_kms          equal 7.8        # km/s
+variable vin_Afs          equal ${vin_kms}*0.01   # Å/fs  (1 km/s = 0.01 Å/fs)
+variable Tdamp            equal 100.0      # fs (for NVT)
+variable kB               equal 0.0019872041   # kcal/mol·K
+# 转换系数移到后处理，这里不再使用：
+# variable kcalmolA3_to_GPa equal 6.947695
+
+# =================== Read data ===================
+region       box block 0.0 62.35382907247957  0.0 64.800000000000011  0.0 316.75
+read_data    hopg_with_O_final.data
+mass         1 12.011     # C
+mass         2 16.000     # O
+
+# ============ reax/c & QEq =================
+pair_style   reax/c NULL safezone 3.0 mincap 5000
+pair_coeff   * * ffield.reax.cho C O
+fix          qeq all qeq/reax 1 0.0 10.0 1e-6 param.qeq
+
+# ---------- Neighbor list AFTER pair_style ----------
+neighbor     2.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# ========== Groups & Regions ==========
+group        fixed_layer id <= 1500      # 固定底部石墨烯
+group        carbon   type 1
+group        oatoms   type 2
+group        mobile subtract all fixed_layer
+group        carbon_mob subtract carbon fixed_layer
+
+# ========== Fix bottom layer ==========
+fix          hold fixed_layer setforce 0.0 0.0 0.0
+velocity     fixed_layer set 0.0 0.0 0.0 units box
+
+# ========== Reflective walls for relaxation ==========
+fix          wall_lo_o   oatoms wall/reflect zlo 95.0  units box
+fix          wall_hi     all    wall/reflect zhi EDGE units box
+fix          wall_bottom all    wall/reflect zlo EDGE units box
+
+# ============== Initial NVT relaxation ==============
+velocity     oatoms     create ${T} 12345 mom yes rot yes dist gaussian units box
+velocity     carbon_mob create ${T} 12345 mom yes rot yes dist gaussian units box
+fix          relax_c carbon_mob nvt temp ${T} ${T} ${Tdamp}
+fix          relax_o oatoms     nvt temp ${T} ${T} ${Tdamp}
+timestep     0.25
+
+# --- Dump for relaxation phase ---
+dump         relax_dump all xyz 1000 relaxation_${T}.xyz
+dump_modify  relax_dump element C O
+
+run          40000   # ~10 ps
+
+unfix        relax_c
+unfix        relax_o
+unfix        wall_lo_o
+undump       relax_dump
+reset_timestep 0
+
+# ========== Production ==========
+# 触发区：z in [90,120] Å
+region       rinj block EDGE EDGE EDGE EDGE 90.0 120.0 units box
+group        rinj region rinj
+group        o_kick dynamic oatoms region rinj every 1
+
+# 热汇层：ID 1501–4500 的移动碳
+group        bath_ge id >= 1501
+group        bath_le id <= 4500
+group        bath    intersect bath_ge bath_le
+group        bath    intersect bath carbon_mob
+group        mobile_wo_bath subtract mobile bath
+
+# 积分 & 热浴
+fix          integrator  mobile_wo_bath nve
+fix          bath_nve    bath nve
+fix          bath_lgv    bath langevin ${T} ${T} 1000.0 492753 zero yes tally yes
+
+# z 向分层（层厚 2 Å），用于统计
+compute      cc1 all chunk/atom bin/1d z lower 2.0 units box
+
+# 温度诊断
+compute      Tsub    carbon_mob temp
+compute      Tbeam   oatoms     temp
+compute      Tmobile mobile     temp
+compute_modify Tsub    dynamic/dof yes
+compute_modify Tbeam   dynamic/dof yes
+compute_modify Tmobile dynamic/dof yes
+
+thermo_style custom step c_Tmobile c_Tsub c_Tbeam pe ke etotal atoms
+thermo       100
+fix          Tlog all ave/time 1 1000 1000 c_Tmobile c_Tsub c_Tbeam file temps.out
+
+# 每层温度（去层质心平移）
+compute      Tchunk all temp/chunk cc1 temp com yes
+fix          Tprof  all ave/time 100 10 1000 c_Tchunk file Tz_profile.dat
+
+# 每层 virial（注意：stress/atom 返回的是 -σV，单位 kcal/mol）
+compute      MyStress all stress/atom NULL
+fix          Sprof    all ave/chunk 100 10 1000 cc1 c_MyStress[1] c_MyStress[2] c_MyStress[3] file virial_z.dat
+
+# ========== Per-atom diagnostics for post-processing ==========
+compute      MyKE   all ke/atom
+variable     MyTemp atom c_MyKE/(1.5*v_kB)
+
+# Voronoi 体积（Å^3），用于后处理除体积
+# （使用默认的周期/非周期设置：x,y 周期；z 非周期＝由盒面截断）
+# compute      MyVoro all voronoi/atom
+
+# 物种统计（Reax/C）
+fix          spe all reax/c/species 1 2 20 species.out element C O
+
+# ========== Trajectory Dumps (raw virial + volume; NO unit conversion) ==========
+dump         trj all custom 100 trajectory.T_${T}_v${vin_kms}.lammpstrj id type x y z vx vy vz c_MyKE v_MyTemp c_MyStress[1] c_MyStress[2] c_MyStress[3] c_MyStress[4] c_MyStress[5] c_MyStress[6] # c_MyVoro[1]
+dump_modify  trj sort id flush yes
+restart      200000 restart_${T}K.bin
+thermo_modify flush yes lost warn
+
+# 烧蚀筛选（示例：C 原子、z>50 Å、邻接数 < 2.1）
+compute      ccoord carbon coord/atom cutoff 1.9
+variable     is_ablate atom (type==1)&&(z>50.0)&&(c_ccoord<2.1)
+
+dump         abl carbon custom 10 ablate.lammpstrj id type x y z c_ccoord c_cc1 c_MyStress[1] c_MyStress[2] c_MyStress[3] c_MyStress[4] c_MyStress[5] c_MyStress[6] # c_MyVoro[1]
+dump_modify  abl thresh v_is_ablate > 0.5 sort id
+
+# ---------------- Main run ----------------
+timestep     0.1
+
+# 每 1000 步给触发区 O 原子一个 -z 方向速度（-vin_Afs）
+run          1000000 every 1000 "velocity o_kick set NULL NULL -${vin_Afs} sum no units box"

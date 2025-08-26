@@ -1,0 +1,26 @@
+units		real
+boundary	p p f
+dimension	3
+atom_style	charge
+neighbor	2.0 bin
+neigh_modify	every 1 delay 0 check yes
+
+# ---------------- User parameters ----------------
+variable T           equal 2500.0      # K
+variable vin_kms     equal 6.0         # km/s
+variable vin_Afs     equal ${vin_kms}*0.01   # Å/fs
+variable sigma_GPa   equal 0.0
+variable Tdamp       equal 100.0       # fs
+variable slab_th     equal 1.0         # Å
+variable Fz          equal ${sigma_GPa}*1.439326e-4  # GPa→kcal/mol Å⁻³
+
+region		box block 0.0 12.470765814495914 0.0 12.960000000000001 0.0  70.049999999999997 units box
+create_box  2 box_region
+read_data   hopg_init.data add append
+mass 1 12.011
+mass 2 16.000
+
+# ============ ReaxFF & QEq (moved up!) =============
+pair_style  reax/c NULL safezone 3.0 mincap 10000
+pair_coeff  * * ffield.reax.cho C O
+fix         qeq all qeq/reax 1 0.0 10.0 1e-6 param.qeq  

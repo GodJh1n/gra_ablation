@@ -1,0 +1,121 @@
+# ======================= Global Settings =======================
+processors     11 11 1
+units          real
+atom_style     charge             # required for reax/c
+boundary       p p f
+dimension      3
+
+# ---------------- User parameters ----------------
+variable T equal 2000.0    # K
+variable vin_kms     equal 7.76       # km/s
+variable vin_Afs     equal ${vin_kms}*0.01  # Å/fs
+variable Tdamp       equal 100.0     # fs (for NVT)
+variable kB          equal 0.0019872041   # kcal/mol·K
+variable Atm2GPa     equal 0.000101325     # conversion
+
+# =================== Read in your combined data ===================
+region	    box block 0.0 62.35382907247957 0.0 64.800000000000011 0.0 316.75
+read_data    hopg_with_O_final.data
+mass         1 12.011     # C
+mass         2 16.000     # O
+
+# ============ reax/c & QEq =================
+pair_style  reax/c NULL safezone 3.0 mincap 5000
+pair_coeff  * * ffield.reax.cho C O
+fix         qeq all qeq/reax 1 0.0 10.0 1e-6 param.qeq
+
+# ---------- Neighbor list AFTER pair_style ----------
+neighbor     2.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# ========== Groups & Regions ==========
+# 1) Substrate region for fixing bottom graphene
+group	 fixed_layer id <= 1500
+
+# 2) Atom‐type groups
+group     carbon   type 1
+group     oatoms   type 2
+
+# 3) Mobile = everything except the fixed bottom layer
+group     mobile subtract all fixed_layer
+
+# ========== Fix bottom layer ==========
+fix       hold fixed_layer setforce 0.0 0.0 0.0
+velocity  fixed_layer set 0.0 0.0 0.0 units box
+
+# ========== Reflective walls for relaxation ==========
+fix       wall_lo_o   oatoms wall/reflect zlo 60.0  units box
+fix       wall_hi all wall/reflect zhi EDGE       units box
+fix       wall_bottom all wall/reflect zlo EDGE
+
+# ============== Initial NVT relaxation ==============
+velocity mobile create ${T} 12345 mom yes rot yes dist gaussian
+fix      relax mobile nvt temp ${T} ${T} ${Tdamp}
+timestep 0.1
+
+# --- Dump for relaxation phase ---
+dump        relax_dump all xyz 100 relaxation_${T}.xyz
+dump_modify relax_dump element C O
+thermo 100
+
+# --- Run the relaxation ---
+run      5000  # 5 ps test run
+
+unfix   relax
+unfix   wall_lo_o
+undump   relax_dump
+reset_timestep 0
+
+# 2) Acceleration zone for O atoms
+region    accel block 0.0 62.35382907247957 0.0 64.8000000000000 60.0 100.0  units box
+group     accel region accel
+group     o_acc intersect oatoms accel
+velocity  o_acc set NULL NULL -${vin_Afs} sum no units box
+
+
+# ========== Production integrator (NVE) ==========
+fix       integrator mobile nve
+
+# Global temperature (includes deposits); DOF changes over time
+compute  Tall all temp
+compute_modify Tall dynamic/dof yes
+
+# Substrate temperature (carbon only)
+group    carbon_mob subtract carbon fixed_layer
+compute  Tsub carbon_mob temp
+compute_modify Tsub dynamic/dof yes
+
+# Beam/gas temperature (deposited O atoms only; see deposit group below)
+compute  Tbeam oatoms temp
+compute_modify Tbeam dynamic/dof yes
+
+# Print all three temps in thermo
+thermo_style  custom step temp c_Tsub c_Tbeam c_Tall pe ke etotal atoms
+thermo		100
+thermo_modify temp Tall
+
+# Optional: also write a time series to file (every 1000 steps)
+fix     Tlog all ave/time 1 1000 1000 c_Tsub c_Tbeam c_Tall file temps.out
+
+# ========== Thermal & Stress Diagnostics ==========
+compute   MyStress all stress/atom NULL
+compute   MyKE     all ke/atom
+variable  MyTemp   atom c_MyKE/(1.5*v_kB)
+#compute   MyVoro   all voronoi/atom
+fix	spe all reax/c/species 1 2 20 species.out  element C O
+# convert to GPa
+#variable  s_xx_gpa atom c_MyStress[1]/c_MyVoro[1]*v_Atm2GPa
+#variable  s_yy_gpa atom c_MyStress[2]/c_MyVoro[1]*v_Atm2GPa
+#variable  s_zz_gpa atom c_MyStress[3]/c_MyVoro[1]*v_Atm2GPa
+#variable  s_xy_gpa atom c_MyStress[4]/c_MyVoro[1]*v_Atm2GPa
+#variable  s_xz_gpa atom c_MyStress[5]/c_MyVoro[1]*v_Atm2GPa
+#variable  s_yz_gpa atom c_MyStress[6]/c_MyVoro[1]*v_Atm2GPa
+
+# ========== Trajectory Dump ==========
+dump      1 all custom 100 trajectory.T_${T}_v${vin_kms}.lammpstrj id type x y z vx vy vz c_MyStress[1] c_MyStress[2] c_MyStress[3] c_MyStress[4] c_MyStress[5] c_MyStress[6]
+restart   200000 restart_${T}K.bin
+
+# ---------------- Main run ----------------
+timestep  0.1
+run       1000000      # 100ps
+

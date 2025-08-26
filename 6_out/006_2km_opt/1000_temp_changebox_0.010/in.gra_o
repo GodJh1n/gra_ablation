@@ -1,0 +1,189 @@
+# ======================= Global Settings =======================
+processors     * * 1
+units          real
+atom_style     charge             # required for reax/c
+boundary       p p f
+dimension      3
+
+# ---------------- User parameters ----------------
+variable T equal 1900.0    # K
+variable vin_kms     equal 7.8       # km/s
+variable vin_Afs     equal ${vin_kms}*0.01  # Å/fs
+variable Tdamp       equal 100.0     # fs (for NVT)
+variable kB          equal 0.0019872041   # kcal/mol·K
+# variable Atm2GPa     equal 0.000101325     # conversion
+variable kcalmolA3_to_GPa equal 6.947695
+
+# =================== Read in your combined data ===================
+region	     box block 0.0 62.35382907247957 0.0 64.800000000000011 0.0 316.75
+read_data    hopg_with_O_final.data
+mass         1 12.011     # C
+mass         2 16.000     # O
+
+# 设定双轴应变（可扫参）
+variable ex equal 0.010
+variable ey equal 0.010
+
+# 计算缩放因子 S = 1 + ε
+variable Sx equal 1.0+v_ex
+variable Sy equal 1.0+v_ey
+
+# 等比例缩放盒子并 remap 原子坐标（速度不变）
+change_box all x scale ${Sx} y scale ${Sy} remap units box
+run 0   # 强制重建邻居与内部状态
+
+
+# ============ reax/c & QEq =================
+pair_style  reax/c NULL safezone 5.0 mincap 10000
+pair_coeff  * * ffield.reax.cho C O
+fix         qeq all qeq/reax 1 0.0 10.0 1e-6 param.qeq
+
+# ---------- Neighbor list AFTER pair_style ----------
+neighbor     2.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# ========== Groups & Regions ==========
+# 1) Substrate region for fixing bottom graphene
+group	 fixed_layer id <= 1500
+
+# 2) Atom‐type groups
+group     carbon   type 1
+group     oatoms   type 2
+
+# 3) Mobile = everything except the fixed bottom layer
+group     mobile subtract all fixed_layer
+group     carbon_mob subtract carbon fixed_layer
+
+# ========== Fix bottom layer ==========
+fix       hold fixed_layer setforce 0.0 0.0 0.0
+velocity  fixed_layer set 0.0 0.0 0.0 units box
+
+# ========== Reflective walls for relaxation ==========
+fix       wall_lo_o   oatoms wall/reflect zlo 95.0  units box
+fix       wall_hi all wall/reflect zhi EDGE       units box
+fix       wall_bottom all wall/reflect zlo EDGE units box
+
+# ============== Initial NVT relaxation ==============
+velocity oatoms     create ${T} 12345 mom yes rot yes dist gaussian units box
+velocity carbon_mob create ${T} 12345 mom yes rot yes dist gaussian units box
+
+fix      relax_c carbon_mob nvt temp ${T} ${T} ${Tdamp}
+fix      relax_o oatoms     nvt temp ${T} ${T} ${Tdamp}
+
+timestep 0.25
+
+# --- Dump for relaxation phase ---
+dump        relax_dump all xyz 1000 relaxation_${T}.xyz
+dump_modify relax_dump element C O
+
+# --- Run the relaxation ---
+run      40000  # 10 ps test run
+
+unfix   relax_c
+unfix   relax_o
+unfix   wall_lo_o
+undump   relax_dump
+reset_timestep 0
+
+# 2) Acceleration zone for O atoms
+# region    accel block 0.0 62.35382907247957 0.0 64.8000000000000 60.0 100.0  units box
+# group     accel region accel
+# group     o_acc intersect oatoms accel
+# velocity  o_acc set NULL NULL -${vin_Afs} sum no units box
+
+# ========== Production integrator (NVE) ==========
+# ===== 定义“触发区”：z < 90 Å =====
+region  rinj block EDGE EDGE EDGE EDGE  90.0 120.0  units box
+group     rinj region rinj
+group   o_kick dynamic oatoms region rinj every 1
+
+# --- Two bottom heat-sink layers by atom IDs (C only): 1501–4500 ---
+
+# 先用 ID 条件构造区间：[1501, 4500]
+group  bath_ge id >= 1501
+group  bath_le id <= 4500
+group  bath    intersect bath_ge bath_le
+
+# 只保留“移动的碳原子”（排除固定层 & 任何非碳原子）
+group  bath    intersect bath carbon_mob
+
+# 为避免双重积分：把可动原子拆成“除热汇外的移动原子”与“热汇原子”
+group  mobile_wo_bath subtract mobile bath
+
+# 重新布置积分与热浴（不要重复 fix 同名 integrator）
+fix    integrator     mobile_wo_bath nve
+
+# 对热汇区既积分又施加温和 Langevin 抽热
+fix    bath_nve       bath nve
+fix    bath_lgv       bath langevin ${T} ${T} 1000.0 492753 zero yes tally yes
+# 说明：
+#  - 1000 fs ≈ 1 ps 的阻尼，抽热温和；可按需调到 1000–5000
+#  - zero yes 去掉整体漂移，只抽热不拉动整体动量
+#  - tally yes 便于能量统计
+
+# z 向分层（层厚 2 Å），仅用于在 ablate dump 里输出 c_cc1（层ID）
+compute cc1 all chunk/atom bin/1d z lower 2.0 units box
+
+# Substrate temperature (carbon only)
+compute  Tsub carbon_mob temp
+compute_modify Tsub dynamic/dof yes
+
+# Beam/gas temperature (deposited O atoms only; see deposit group below)
+compute  Tbeam oatoms temp
+compute_modify Tbeam dynamic/dof yes
+
+# Print all three temps in thermo
+compute  Tmobile mobile     temp
+compute_modify Tmobile dynamic/dof yes
+
+thermo_style custom step c_Tmobile c_Tsub c_Tbeam pe ke etotal atoms
+
+thermo		100
+
+# Optional: also write a time series to file (every 1000 steps)
+fix     Tlog all ave/time 1 1000 1000 c_Tmobile c_Tsub c_Tbeam file temps.out
+
+# 每层温度，去除每层质心平移
+compute Tchunk all temp/chunk cc1 temp com yes
+# 直接对 "全局 array" 做时间平均/输出
+fix     Tprof  all ave/time 100 10 1000 c_Tchunk file Tz_profile.dat
+
+# 每层 virial（stress/atom 返回 -σV），后处理用 σ(z) = -sum(Virial)/ (Lx*Ly*Δz)
+compute MyStress all stress/atom NULL
+fix     Sprof    all ave/chunk 100 10 1000 cc1 c_MyStress[1] c_MyStress[2] c_MyStress[3] file virial_z.dat
+
+
+# ========== Thermal & Stress Diagnostics ==========
+compute   MyKE     all ke/atom
+variable  MyTemp   atom c_MyKE/(1.5*v_kB)
+compute   MyVoro   all voronoi/atom
+
+# fix bonds all reax/c/bonds 20 bonds.out
+fix	spe all reax/c/species 1 2 20 species.out  element C O
+
+# stress/atom 
+variable  s_xx_gpa atom -c_MyStress[1]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+variable  s_yy_gpa atom -c_MyStress[2]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+variable  s_zz_gpa atom -c_MyStress[3]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+variable  s_xy_gpa atom -c_MyStress[4]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+variable  s_xz_gpa atom -c_MyStress[5]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+variable  s_yz_gpa atom -c_MyStress[6]/c_MyVoro[1]*v_kcalmolA3_to_GPa
+
+
+# ========== Trajectory Dump ==========
+dump      1 all custom 100 trajectory.T_${T}_v${vin_kms}.lammpstrj id type x y z vx vy vz c_MyKE v_MyTemp v_s_xx_gpa v_s_yy_gpa v_s_zz_gpa v_s_xy_gpa v_s_xz_gpa v_s_yz_gpa
+restart   200000 restart_${T}K.bin
+dump_modify 1 sort id flush yes
+thermo_modify flush yes lost warn
+
+compute ccoord carbon coord/atom cutoff 1.9     # C–C 邻域半径按你的石墨烯键长调整
+variable is_ablate atom (type==1)&&(z>30.0)&&(c_ccoord<2.1)
+dump abl carbon custom 10 ablate.lammpstrj id type x y z c_ccoord c_cc1 v_s_xx_gpa v_s_yy_gpa v_s_zz_gpa v_s_xy_gpa v_s_xz_gpa v_s_yz_gpa
+dump_modify abl thresh v_is_ablate > 0.5 sort id
+
+
+# ---------------- Main run ----------------
+timestep  0.1
+
+# 主运行：每 1000 步将 o_kick 组原子的速度强制设为 -vin_Afs（-z 方向）
+run 1000000 every 1000 "velocity o_kick set NULL NULL -${vin_Afs} sum no units box"
